@@ -3,31 +3,86 @@
 import Homey from 'homey';
 import NiceHashLib from '../../nicehash/lib';
 
+/**
+ * NiceHash Rig device - monitors and controls individual mining rigs.
+ * Implements Autopilot system for profitability-based start/stop automation.
+ *
+ * Core Features:
+ * - Real-time rig monitoring (60-second updates)
+ * - Hash rate normalization from H to EH
+ * - Profitability calculation in mBTC and local currency
+ * - Autopilot: automatic start/stop based on net profitability
+ * - Rolling profit averaging (7-minute window)
+ * - Tariff limit learning
+ * - Cumulative power and revenue metering
+ * - Support for both legacy and v4 devices
+ *
+ * Autopilot Algorithm:
+ * 1. Calculate net profitability = (revenue - power cost) / power cost * 100%
+ * 2. Maintain 7-minute rolling average to smooth variance
+ * 3. If rolling profit < threshold for 7 minutes: stop mining, record tariff limit
+ * 4. Won't restart until power tariff drops below learned limit (or 7-hour timeout)
+ * 5. If profitable: raise tariff limit to allow mining at higher rates
+ *
+ * Dependencies:
+ * - Uses: nicehash/lib.ts for API operations
+ * - Syncs every: 60 seconds (rig details), 60 minutes (algorithms)
+ *
+ * @class NiceHashRigDevice
+ * @extends {Homey.Device}
+ */
 class NiceHashRigDevice extends Homey.Device {
 
-  niceHashLib: NiceHashLib | undefined; // NiceHash library
-  details: any; // Rig details
-  detailsSyncTimer: any; // Timer for syncing rig details
-  lastSync: number = 0; // When was the last time we synced rig status with NiceHash
-  lastMined: number = 0; // When was the last time we mined
-  benchmarkStart: number = 0; // benchmark start time
-  smartMagicNumber: number = 7; // 7 is the magic number
-  rollingProfit: number = 0; // smartMagicNumber minutes rolling profit
-  algorithms: any; // Algorithms
-  getAlgorithmsTimer: any; // Timer for getting algorithms
+  niceHashLib: NiceHashLib | undefined; // NiceHash API library instance
+  details: any; // Last fetched rig details from NiceHash
+  detailsSyncTimer: any; // Timer for 60-second rig detail sync
+  lastSync: number = 0; // Timestamp of last successful sync (for cumulative meters)
+  lastMined: number = 0; // Timestamp when rig was last actively mining
+  benchmarkStart: number = 0; // When current profitability benchmark period started
+  smartMagicNumber: number = 7; // Rolling average window: 7 minutes
+  rollingProfit: number = 0; // Rolling average of net profitability percentage
+  algorithms: any; // Algorithm lookup table for v4 devices (indexed by order/ID)
+  getAlgorithmsTimer: any; // Timer for hourly algorithm list refresh
 
   /**
-   * onInit is called when the device is initialized.
+   * Initializes the rig device.
+   * Sets up capabilities, timers, and capability listeners for rig control.
+   *
+   * Complexity: O(1) - fixed initialization steps
+   *
+   * Initialization sequence:
+   * 1. Create NiceHashLib instance
+   * 2. Start hourly algorithm refresh timer
+   * 3. Add missing capabilities (for app updates)
+   * 4. Start 60-second rig detail sync
+   * 5. Register capability listeners (onoff, smart_mode, smart_mode_min_profitability)
+   *
+   * Capabilities added if missing:
+   * - smart_mode: Autopilot enable/disable
+   * - measure_cost_scarab: Power cost in local currency
+   * - measure_profit_scarab: Revenue in local currency
+   * - meter_cost_scarab: Cumulative cost in local currency
+   * - meter_profit_scarab: Cumulative revenue in local currency
+   * - measure_profit_percent: Net profitability percentage
+   * - measure_temperature: GPU temperature
+   * - measure_load: GPU load percentage
+   * - power_mode: LOW/MEDIUM/HIGH
+   * - measure_tariff_limit: Learned tariff limit
+   * - smart_mode_min_profitability: Minimum profitability threshold
+   *
+   * @returns {Promise<void>}
    */
   async onInit() {
     this.log('NiceHashRigDevice has been initialized');
     this.niceHashLib = new NiceHashLib();
 
+    // Start hourly algorithm refresh (needed for v4 device algorithm names)
     this.algorithms = [];
     this.getAlgorithmsTimer = this.homey.setInterval(() => {
       this.getAlgorithms();
-    }, 60 * 60 * 1000);
+    }, 60 * 60 * 1000); // 60 minutes
 
+    // Add capabilities if missing (ensures compatibility after app updates)
     if (!this.hasCapability('smart_mode')) await this.addCapability('smart_mode');
     if (!this.hasCapability('measure_cost_scarab')) await this.addCapability('measure_cost_scarab');
     if (!this.hasCapability('measure_profit_scarab')) await this.addCapability('measure_profit_scarab');
@@ -40,12 +95,13 @@ class NiceHashRigDevice extends Homey.Device {
     if (!this.hasCapability('measure_tariff_limit')) await this.addCapability('measure_tariff_limit');
     if (!this.hasCapability('smart_mode_min_profitability')) await this.addCapability('smart_mode_min_profitability');
 
+    // Start rig detail synchronization (immediate + 60-second interval)
     this.syncRigDetails().catch(this.error);
     this.detailsSyncTimer = this.homey.setInterval(() => {
       this.syncRigDetails().catch(this.error);
-    }, 60000);
+    }, 60000); // 60 seconds
 
-    // Register capability listeners
+    // Register capability listeners for user interactions
     this.registerCapabilityListener('onoff', async value => {
       console.log('Device onoff =', value);
       await this.niceHashLib?.setRigStatus(this.getData().id, value);
@@ -53,6 +109,7 @@ class NiceHashRigDevice extends Homey.Device {
 
     this.registerCapabilityListener('smart_mode', async value => {
       console.log('Autopilot =', value);
+      // When Autopilot is enabled, start rig to begin profitability assessment
       await this.niceHashLib?.setRigStatus(this.getData().id, value);
     });
 
@@ -62,11 +119,22 @@ class NiceHashRigDevice extends Homey.Device {
     });
   }
 
+  /**
+   * Fetches mining algorithms from NiceHash API.
+   * Updates algorithm lookup table indexed by algorithm order (ID).
+   * Required for v4 devices which return algorithm IDs instead of names.
+   *
+   * Complexity: O(n) where n = number of algorithms (~50)
+   *
+   * @returns {Promise<void>}
+   * @private
+   */
   private async getAlgorithms() {
     if (this.niceHashLib) {
       const algos = await this.niceHashLib.getAlgorithms().catch(this.error);
       if (algos && algos.miningAlgorithms) {
         this.algorithms = [];
+        // Index algorithms by 'order' field for quick lookup
         for (const algo of algos.miningAlgorithms) {
           this.algorithms[algo.order] = algo;
         }
@@ -74,10 +142,46 @@ class NiceHashRigDevice extends Homey.Device {
     }
   }
 
-  /*
-    syncRigDetails() is called to sync device status with NiceHash.
-    If Autopilot is enabled, it will also start/stop mining based on profitability.
-  */
+  /**
+   * Synchronizes rig status with NiceHash and implements Autopilot profitability logic.
+   * Called every 60 seconds. This is the core method containing the Autopilot algorithm.
+   *
+   * Complexity: O(d) where d = number of devices in rig (typically 1-8 GPUs)
+   *
+   * Main Algorithm Flow:
+   * 1. Fetch rig details from NiceHash API
+   * 2. Aggregate power, temperature, load, and hash rates from all devices
+   * 3. Normalize hash rates from H/kH/MH/GH/TH/PH/EH to MH
+   * 4. Handle both legacy devices and v4 devices (with algorithm lookup)
+   * 5. Calculate profitability in mBTC and local currency
+   * 6. Update cumulative meters (power, revenue, cost)
+   * 7. AUTOPILOT LOGIC:
+   *    a. If NOT mining + Autopilot enabled + (no tariff limit OR tariff below limit OR 7-hour timeout):
+   *       → START mining to assess profitability
+   *    b. If mining + hashrate available:
+   *       - Calculate rolling profit average (7-minute EMA window)
+   *       - After 7-minute benchmark period:
+   *         * If rolling profit < threshold AND instant profit < threshold:
+   *           → STOP mining, record current tariff as limit
+   *         * If profitable and tariff > limit:
+   *           → RAISE tariff limit to current tariff
+   *
+   * Autopilot Start Conditions (ANY of these):
+   * - No tariff limit set (tariff_limit === -1)
+   * - Current tariff below learned limit (tariff < tariff_limit)
+   * - Haven't mined in 7 hours (forces re-benchmark)
+   *
+   * Autopilot Stop Conditions (BOTH must be true):
+   * - Rolling 7-minute average < minimum profitability
+   * - Current instant profitability < minimum profitability
+   *
+   * Rolling Average Formula:
+   * rollingProfit = rollingProfit * (6/7) + currentProfit * (1/7)
+   * This is an Exponential Moving Average (EMA) with α = 1/7
+   *
+   * @returns {Promise<void>}
+   * @private
+   */
   async syncRigDetails() {
     const settings = this.getSettings();
     let powerUsage = 0.0;
@@ -125,28 +229,29 @@ class NiceHashRigDevice extends Homey.Device {
             if (!algorithms.includes(speed.title)) {
               algorithms += (algorithms ? ', ' : '') + speed.title;
             }
+            // Normalize all hash rates to MH (megahashes) for consistency
             let r = Number.parseFloat(speed.speed);
             switch (speed.displaySuffix) {
               case 'H':
-                r /= 1000000; // A for effort
+                r /= 1000000; // H → MH: Divide by 1M (A for effort)
                 break;
               case 'kH':
-                r /= 1000; // You'll get there
+                r /= 1000; // kH → MH: Divide by 1K (You'll get there)
                 break;
               case 'GH':
-                r /= 0.001; // Wow, cool rig
+                r /= 0.001; // GH → MH: Multiply by 1K (Wow, cool rig)
                 break;
               case 'TH':
-                r /= 0.000001; // Hi Elon
+                r /= 0.000001; // TH → MH: Multiply by 1M (Hi Elon)
                 break;
               case 'PH':
-                r /= 0.000000001; // Holy shit, well this will probably overflow but you can afford it
+                r /= 0.000000001; // PH → MH: Multiply by 1B (Holy shit, well this will probably overflow but you can afford it)
                 break;
               case 'EH':
-                r /= 0.000000000001; // Godspeed, sheik
+                r /= 0.000000000001; // EH → MH: Multiply by 1T (Godspeed, sheik)
                 break;
               default:
-                break; // Hi average miner (or I have no idea what you are mining)
+                break; // MH or unknown unit - use as-is (Hi average miner)
             }
             hashrate += r;
           }
@@ -221,12 +326,17 @@ class NiceHashRigDevice extends Homey.Device {
         this.benchmarkStart = 0;
         this.rollingProfit = 0;
 
+        // AUTOPILOT START LOGIC: Determine if rig should start mining
         if (smart_mode
           && (tariff_limit === -1 || tariff_limit > power_tariff
             || this.lastMined === 0 || (this.lastMined && Date.now() - this.lastMined > 1000 * 60 * 60 * this.smartMagicNumber))) {
-          // We're in autopilot, and we're not mining, and we're either not limited by tariff,
-          // or we are but current power tariff is lower than tariff limit,
-          // or we haven't been mining for smartMagicNumber hours (force new benchmark every so often, will stop rig if it's not profitable)
+          // Start mining if ALL of these are true:
+          // 1. Autopilot is enabled (smart_mode = true)
+          // 2. We're not currently mining (mining === 0)
+          // 3. AND ANY of these conditions:
+          //    a) No tariff limit learned yet (tariff_limit === -1)
+          //    b) Current tariff is below learned limit (tariff < tariff_limit)
+          //    c) Haven't mined in 7 hours (forces periodic re-benchmark)
           console.log('Autopilot starting rig (tariff limit = ', tariff_limit, 'power_tariff = ', `${power_tariff})`);
           await this.niceHashLib?.setRigStatus(this.getData().id, true);
         }
@@ -327,36 +437,44 @@ class NiceHashRigDevice extends Homey.Device {
           this.setCapabilityValue('meter_cost_scarab', Math.round((new_meter_cost * mBTCRate) * 100) / 100).catch(this.error);
         }
 
-        if (hashrate) { // Skip if we are waiting for a job
-          // Calculate rolling profit percentage
+        if (hashrate) { // Skip profitability assessment if waiting for mining job
+          // ROLLING PROFIT CALCULATION: Exponential Moving Average over 7 minutes
           if (this.benchmarkStart === 0) {
+            // First profitability reading: initialize benchmark period
             this.benchmarkStart = new Date().getTime();
             this.rollingProfit = profitPct;
           } else {
+            // Update rolling average using EMA formula:
+            // newAvg = oldAvg * (6/7) + newValue * (1/7)
+            // This gives more weight to recent values while smoothing out variance
             this.rollingProfit = this.rollingProfit * ((this.smartMagicNumber - 1) / this.smartMagicNumber) + profitPct * (1 / this.smartMagicNumber);
           }
 
           console.log(' Rolling Profit:', this.rollingProfit, '%');
 
+          // AUTOPILOT STOP LOGIC: Only make decisions after 7-minute benchmark period
           if (this.benchmarkStart > 0 && (new Date().getTime() - this.benchmarkStart) > this.smartMagicNumber * 60000) {
-            // Autopilot
+            // Benchmark period complete (7 minutes of mining data collected)
+
             if (this.rollingProfit < smart_mode_min_profitability && profitPct < smart_mode_min_profitability) {
-              // Rig is not profitable
+              // STOP CONDITION: Both rolling average AND instant profit below threshold
+              // This dual check prevents stopping due to temporary profit dips
               console.log('Rig is not profitable (profit = ', profitPct, ' rolling profit = ', this.rollingProfit, '%', 'minimum profitability = ', smart_mode_min_profitability, '%)');
 
-              // Set tariff limit to current tariff
+              // Learn tariff limit: record current tariff as "unprofitable threshold"
+              // Rig won't restart until tariff drops below this limit
               console.log('Setting tariff limit to ', power_tariff, ' (was ', tariff_limit, ')');
               this.setStoreValue('tariff_limit', power_tariff);
 
               if (smart_mode) {
-                // Stop rig
+                // Autopilot enabled: stop mining
                 console.log('Autopilot stopping rig (tariff limit = ', tariff_limit, 'power_tariff = ', `${power_tariff})`);
                 await this.niceHashLib?.setRigStatus(this.getData().id, false);
               }
             } else {
-              // Rig is profitable
+              // Rig is profitable: update tariff limit if current tariff is higher
+              // This allows mining at progressively higher tariffs as long as it remains profitable
               if (power_tariff > tariff_limit) {
-                // Raise tariff limit to current tariff
                 console.log('Raising tariff limit to ', power_tariff, ' (was ', tariff_limit, ')');
                 this.setStoreValue('tariff_limit', power_tariff);
               }
@@ -368,49 +486,81 @@ class NiceHashRigDevice extends Homey.Device {
     this.lastSync = new Date().getTime();
   }
 
+  /**
+   * Updates the Autopilot minimum profitability threshold.
+   * Triggers a new benchmark by starting the rig (if not already mining).
+   *
+   * Complexity: O(1)
+   *
+   * @param {number} minProfitability - Minimum net profitability percentage (0-100)
+   * @returns {Promise<void>}
+   */
   async setSmartModeMinProfitability(minProfitability: number) {
     await this.setSettings({
       smart_mode_min_profitability: minProfitability,
     });
-    // Benchmark if we are not already mining
+    // Start mining to assess profitability with new threshold
+    // If already mining, this has no effect
     await this.niceHashLib?.setRigStatus(this.getData().id, true);
   }
 
   /**
-   * onAdded is called when the user adds the device, called just after pairing.
+   * Called when the device is added/paired by the user.
+   * Lifecycle hook for post-pairing initialization.
+   *
+   * Complexity: O(1)
+   *
+   * @returns {Promise<void>}
    */
   async onAdded() {
     this.log('NiceHashRigDevice has been added');
   }
 
   /**
-   * onSettings is called when the user updates the device's settings.
-   * @param {object} event the onSettings event data
-   * @param {object} event.oldSettings The old settings object
-   * @param {object} event.newSettings The new settings object
-   * @param {string[]} event.changedKeys An array of keys changed since the previous version
-   * @returns {Promise<string|void>} return a custom message that will be displayed
+   * Called when device settings are changed by the user.
+   * Starts mining to re-assess profitability with new settings.
+   *
+   * Complexity: O(1)
+   *
+   * Settings:
+   * - smart_mode_min_profitability: Minimum net profitability threshold
+   *
+   * @param {object} event - Settings event data
+   * @param {object} event.oldSettings - Previous settings
+   * @param {object} event.newSettings - Updated settings
+   * @param {string[]} event.changedKeys - Array of changed setting keys
+   * @returns {Promise<string|void>} Optional message to show user
    */
   async onSettings({ oldSettings: {}, newSettings: {}, changedKeys: {} }): Promise<string|void> {
     this.log('NiceHashRigDevice settings where changed');
-    // Benchmark if we are not already mining
+    // Start mining to benchmark with new settings
     await this.niceHashLib?.setRigStatus(this.getData().id, true);
   }
 
   /**
-   * onRenamed is called when the user updates the device's name.
-   * This method can be used this to synchronise the name to the device.
-   * @param {string} name The new name
+   * Called when the device is renamed by the user.
+   * Name is purely cosmetic and doesn't affect rig control.
+   *
+   * Complexity: O(1)
+   *
+   * @param {string} name - New device name
+   * @returns {Promise<void>}
    */
   async onRenamed(name: string) {
     this.log('NiceHashRigDevice was renamed');
   }
 
   /**
-   * onDeleted is called when the user deleted the device.
+   * Called when the device is deleted by the user.
+   * Cleans up timers to prevent memory leaks.
+   *
+   * Complexity: O(1)
+   *
+   * @returns {Promise<void>}
    */
   async onDeleted() {
     this.log('NiceHashRigDevice has been deleted');
+    // Stop all timers
     this.homey.clearInterval(this.detailsSyncTimer);
     this.homey.clearInterval(this.getAlgorithmsTimer);
   }
